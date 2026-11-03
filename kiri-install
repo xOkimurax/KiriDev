@@ -1,0 +1,20 @@
+#!/bin/sh
+# Instala algo AHORA y lo anota en /data/setup.sh para que se reinstale solo en cada arranque del contenedor
+# (lo instalado en el sistema se pierde al redesplegar; /data sí persiste).
+#   kiri-install apt paquete1 paquete2 ...
+#   kiri-install cmd 'comando de instalación completo'
+set -e
+SETUP=/data/setup.sh
+usage() { echo "uso: kiri-install apt <paquetes...>  |  kiri-install cmd '<comando>'" >&2; exit 2; }
+[ $# -ge 2 ] || usage
+mode=$1; shift
+case "$mode" in
+  apt) cmd="apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q $*" ;;
+  cmd) cmd="$*" ;;
+  *) usage ;;
+esac
+if ! sudo -n true 2>/dev/null; then echo "kiri-install: el superusuario del contenedor está desactivado (AGENT_ROOT=1 en el despliegue)" >&2; exit 1; fi
+sudo -n sh -c "$cmd"
+[ -f "$SETUP" ] || printf '#!/bin/bash\n# Instalaciones permanentes del agente: se ejecutan como root en cada arranque (solo con AGENT_ROOT=1).\n' > "$SETUP"
+grep -qxF "$cmd" "$SETUP" || echo "$cmd" >> "$SETUP"
+echo "kiri-install: listo y registrado en $SETUP (se reinstalará en cada arranque)"

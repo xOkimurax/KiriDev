@@ -1,0 +1,355 @@
+[
+  {
+    "id": "kiriWhatsApp001",
+    "name": "KiriDev WhatsApp",
+    "active": true,
+    "settings": {
+      "executionOrder": "v1"
+    },
+    "nodes": [
+      {
+        "id": "n1",
+        "name": "Webhook Evolution",
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2,
+        "position": [
+          0,
+          0
+        ],
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "kiri-whatsapp",
+          "options": {}
+        },
+        "webhookId": "kiri-whatsapp"
+      },
+      {
+        "id": "n2",
+        "name": "Clasificar mensaje",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          240,
+          0
+        ],
+        "parameters": {
+          "jsCode": "const body = $input.first().json.body ?? $input.first().json;\nif (body.event && !/messages.upsert/i.test(body.event)) return [];\nconst d = body.data ?? {};\nconst key = d.key ?? {};\nconst jid = key.remoteJid ?? '';\nif (key.fromMe || !jid || jid.endsWith('@broadcast')) return [];\n\nconst b64of = (x) => (x && typeof x === 'object' ? Buffer.from(Array.isArray(x) ? x : Object.keys(x).sort((a, b) => a - b).map((k) => x[k])).toString('base64') : typeof x === 'string' ? x : null);\n\n// EDICIÓN de un mensaje: WhatsApp la manda cifrada (secretEncryptedMessage, tipo 2 = MESSAGE_EDIT). El hub la descifra con la clave del mensaje original.\nconst sec = d.message?.secretEncryptedMessage;\nif (sec?.targetMessageKey?.id && (sec.secretEncType === 2 || sec.secretEncType === 'MESSAGE_EDIT') && sec.encPayload && sec.encIv) {\n  const ed = { sessionId: jid, name: d.pushName || null, key: { id: key.id, remoteJid: jid }, instance: body.instance, kind: 'edit', text: '', quoted: null,\n    edit: { targetId: sec.targetMessageKey.id, encPayload: b64of(sec.encPayload), encIv: b64of(sec.encIv), alt: key.remoteJidAlt ?? null } };\n  if (jid.endsWith('@g.us')) { ed.participant = key.participant ?? d.participant ?? null; ed.botJid = body.sender ?? null; }\n  return [{ json: ed }];\n}\n\n// desenvolver mensajes temporales, de ver una vez, editados y documentos con texto\nlet m = d.message ?? {};\nconst b64 = m.base64 ?? d.base64 ?? null; // si Evolution llegara a incluir el archivo en el webhook\nconst secret = b64of((d.message?.messageContextInfo ?? m.messageContextInfo)?.messageSecret); // clave del mensaje: permite descifrar sus futuras ediciones\nfor (let i = 0; i < 4; i++) {\n  const inner = m.ephemeralMessage?.message ?? m.viewOnceMessage?.message ?? m.viewOnceMessageV2?.message ?? m.documentWithCaptionMessage?.message ?? m.editedMessage?.message ?? null;\n  if (!inner) break;\n  m = inner;\n}\n\n// mensaje citado (respuesta a otro mensaje). Evolution lo manda en data.contextInfo para textos simples,\n// y dentro del mensaje (extendedTextMessage, imageMessage…) en otros casos.\nconst ctx = (m.extendedTextMessage ?? m.imageMessage ?? m.videoMessage ?? m.audioMessage ?? m.documentMessage ?? m.stickerMessage ?? {}).contextInfo ?? m.contextInfo ?? d.contextInfo ?? {};\nconst q = ctx.quotedMessage;\nconst quoted = q ? (q.conversation ?? q.extendedTextMessage?.text ?? q.imageMessage?.caption ?? q.videoMessage?.caption ?? q.documentMessage?.caption ?? q.documentWithCaptionMessage?.message?.documentMessage?.caption ?? (q.audioMessage ? '[nota de voz]' : q.imageMessage ? '[imagen]' : q.videoMessage ? '[video]' : q.documentMessage ? `[documento ${q.documentMessage.fileName ?? ''}]` : q.stickerMessage ? '[sticker]' : q.locationMessage ? '[ubicación]' : null)) : null;\n\nconst ev = { sessionId: jid, name: d.pushName || null, key: { id: key.id, remoteJid: jid }, instance: body.instance, kind: null, text: '', quoted, secret };\n// grupos: quién escribió, a quién mencionaron / respondieron y cuál es la cuenta del agente (el hub decide si le hablan a él)\nif (jid.endsWith('@g.us')) { ev.participant = key.participant ?? d.participant ?? null; ev.mentionedJid = ctx.mentionedJid ?? []; ev.quotedParticipant = ctx.participant ?? null; ev.botJid = body.sender ?? null; }\nconst vcardPhones = (v = '') => [...v.matchAll(/TEL[^:]*:([+\\d\\s().-]+)/g)].map((x) => x[1].trim());\n\nif (m.conversation != null || m.extendedTextMessage) { ev.kind = 'text'; ev.text = m.conversation ?? m.extendedTextMessage.text ?? ''; }\nelse if (m.audioMessage) { ev.kind = 'audio'; ev.seconds = m.audioMessage.seconds; ev.mimetype = m.audioMessage.mimetype; }\nelse if (m.imageMessage) { ev.kind = 'image'; ev.text = m.imageMessage.caption ?? ''; ev.mimetype = m.imageMessage.mimetype; }\nelse if (m.videoMessage) { ev.kind = 'video'; ev.text = m.videoMessage.caption ?? ''; ev.seconds = m.videoMessage.seconds; ev.mimetype = m.videoMessage.mimetype; }\nelse if (m.documentMessage) { ev.kind = 'document'; ev.text = m.documentMessage.caption ?? ''; ev.fileName = m.documentMessage.fileName; ev.mimetype = m.documentMessage.mimetype; }\nelse if (m.locationMessage || m.liveLocationMessage) { const l = m.locationMessage ?? m.liveLocationMessage; ev.kind = 'location'; ev.location = { lat: l.degreesLatitude, lng: l.degreesLongitude, name: l.name, address: l.address }; }\nelse if (m.contactMessage) { ev.kind = 'contact'; ev.contact = { name: m.contactMessage.displayName, phones: vcardPhones(m.contactMessage.vcard) }; }\nelse if (m.contactsArrayMessage) { ev.kind = 'contact'; const cs = m.contactsArrayMessage.contacts ?? []; ev.contact = { name: cs.map((c) => c.displayName).join(', '), phones: cs.flatMap((c) => vcardPhones(c.vcard)) }; }\nelse if (m.stickerMessage) { ev.kind = 'sticker'; ev.mimetype = m.stickerMessage.mimetype; ev.animated = !!m.stickerMessage.isAnimated; }\nelse return []; // reacciones, protocolo, etc.\n\nif (ev.kind === 'text' && !ev.text.trim()) return [];\n\n// datos para bajar y descifrar el archivo (url de WhatsApp + mediaKey)\nconst MEDIA = ['audio', 'image', 'video', 'document', 'sticker'];\nconst mm = m.audioMessage ?? m.imageMessage ?? m.videoMessage ?? m.documentMessage ?? m.stickerMessage ?? null;\nif (mm?.mediaKey && MEDIA.includes(ev.kind)) ev.media = { url: mm.url, directPath: mm.directPath, mediaKey: mm.mediaKey, mimetype: mm.mimetype, fileLength: mm.fileLength };\nif (b64 && MEDIA.includes(ev.kind)) ev.base64 = b64;\nreturn [{ json: ev }];\n"
+        }
+      },
+      {
+        "id": "n3",
+        "name": "Consultar agente",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          480,
+          0
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "={{ $env.HUB_URL }}/api/agent/chat",
+          "sendHeaders": true,
+          "specifyHeaders": "keypair",
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Authorization",
+                "value": "=Bearer {{ $env.AGENT_TOKEN }}"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify($json) }}",
+          "options": {
+            "timeout": 180000
+          }
+        }
+      },
+      {
+        "id": "n4",
+        "name": "¿Hay respuesta?",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.2,
+        "position": [
+          720,
+          0
+        ],
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 2
+            },
+            "conditions": [
+              {
+                "id": "c1",
+                "leftValue": "={{ !!$json.reply || ($json.attachments ?? []).length > 0 }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        }
+      },
+      {
+        "id": "n5",
+        "name": "Esperar demora",
+        "type": "n8n-nodes-base.wait",
+        "typeVersion": 1.1,
+        "position": [
+          840,
+          -80
+        ],
+        "parameters": {
+          "resume": "timeInterval",
+          "amount": "={{ Number($json.delaySec) || 0 }}",
+          "unit": "seconds"
+        },
+        "webhookId": "kiri-wait-delay"
+      },
+      {
+        "id": "n6",
+        "name": "Preparar envíos",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          960,
+          -80
+        ],
+        "parameters": {
+          "jsCode": "const r = $input.first().json;\nconst ev = $('Clasificar mensaje').first().json;\nconst number = ev.sessionId;\nconst base = { instance: ev.instance, replyTo: r.replyTo ?? ev.key?.id ?? null, msgId: r.msgId ?? null };\nconst items = [];\n\n// 0) Corrección por edición: se EDITA el mensaje que el agente ya había enviado (no se manda uno nuevo)\nif (r.edit?.key?.id && r.edit.text) {\n  return [{ json: { ...base, endpoint: 'updateMessage', path: '/chat/updateMessage', body: { number, key: r.edit.key, text: r.edit.text } } }];\n}\n\n// 1) Texto: partir por párrafos y agrupar en mensajes de ~600 caracteres (máximo 4), como escribiría una persona\nconst text = String(r.reply ?? '').trim();\nif (text) {\n  const paras = text.split(/\\n{2,}/).map((s) => s.trim()).filter(Boolean);\n  const chunks = [];\n  let cur = '';\n  for (const p of paras) {\n    if (cur && cur.length + p.length > 600) { chunks.push(cur); cur = p; }\n    else cur = cur ? cur + '\\n\\n' + p : p;\n  }\n  if (cur) chunks.push(cur);\n  while (chunks.length > 4) { const last = chunks.pop(); chunks[chunks.length - 1] += '\\n\\n' + last; }\n  // si el agente decidió citar un mensaje (función \"responder\" de WhatsApp), solo el primer mensaje lleva la cita\n  chunks.forEach((t, i) => items.push({ json: { ...base, endpoint: 'sendText', body: { number, text: t, delay: i === 0 ? 600 : Math.min(2500, 700 + t.length * 12), ...(i === 0 && r.quote ? { quoted: r.quote } : {}) } } }));\n}\n\n// 2) Archivos adjuntos (después del texto): notas de voz como audio, el resto como imagen/video/documento\nfor (const a of (r.attachments ?? []).slice(0, 5)) {\n  if (a.mediatype === 'audio') items.push({ json: { ...base, endpoint: 'sendWhatsAppAudio', body: { number, audio: a.url, delay: 1200 } } });\n  else items.push({ json: { ...base, endpoint: 'sendMedia', body: { number, mediatype: a.mediatype, mimetype: a.mimetype, caption: a.caption || '', media: a.url, fileName: a.fileName, delay: 1000 } } });\n}\nreturn items;\n"
+        }
+      },
+      {
+        "id": "n7",
+        "name": "Enviar por WhatsApp",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1200,
+          -80
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "={{ $env.EVOLUTION_URL }}{{ $json.path || ('/message/' + $json.endpoint) }}/{{ $json.instance }}",
+          "sendHeaders": true,
+          "specifyHeaders": "keypair",
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "apikey",
+                "value": "={{ $env.EVOLUTION_API_KEY }}"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify($json.body) }}",
+          "options": {}
+        },
+        "onError": "continueErrorOutput"
+      },
+      {
+        "id": "n8",
+        "name": "Explicar fallo de envío",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1440,
+          60
+        ],
+        "parameters": {
+          "jsCode": "// Se ejecuta solo cuando Evolution/WhatsApp rechaza un envío: le contamos a la persona qué pasó.\nconst prep = $('Preparar envíos').all();\nconst out = [];\nfor (const it of $input.all()) {\n  const orig = prep[it.pairedItem?.item ?? 0]?.json ?? {};\n  if (orig.endpoint === 'sendText' || orig.endpoint === 'updateMessage') continue; // si falla el texto o la edición no hay forma (ni sentido) de avisar\n  const b = orig.body ?? {};\n  const raw = String(it.json?.error?.message ?? it.json?.error?.description ?? it.json?.message ?? '');\n  const code = String(it.json?.error?.httpCode ?? it.json?.error?.status ?? '');\n  let why;\n  if (/413|too large|entity too large|payload/i.test(raw + code)) why = 'es demasiado pesado para que WhatsApp lo acepte';\n  else if (/timeout|timed out|ETIMEDOUT|ECONNABORTED/i.test(raw)) why = 'tardó demasiado en subirse a WhatsApp';\n  else if (/ECONNREFUSED|ENOTFOUND|socket|fetch|Request failed with status code (403|404)/i.test(raw)) why = 'WhatsApp no pudo descargar el archivo desde mi servidor';\n  else if (/mimetype|media|unsupported|invalid/i.test(raw)) why = 'WhatsApp no aceptó ese tipo de archivo';\n  else why = raw.slice(0, 140) || 'WhatsApp lo rechazó sin dar más detalles';\n  const name = b.fileName ? `«${b.fileName}»` : 'el archivo';\n  out.push({ json: { instance: orig.instance, endpoint: 'sendText', body: { number: b.number, text: `Preparé ${name} pero no pude enviarlo: ${why}. ¿Querés que pruebe de otra forma (otro formato, más liviano, o te paso el enlace)?`, delay: 600 } } });\n}\nreturn out;\n"
+        }
+      },
+      {
+        "id": "n9",
+        "name": "Avisar fallo de envío",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1680,
+          60
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "={{ $env.EVOLUTION_URL }}/message/{{ $json.endpoint }}/{{ $json.instance }}",
+          "sendHeaders": true,
+          "specifyHeaders": "keypair",
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "apikey",
+                "value": "={{ $env.EVOLUTION_API_KEY }}"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify($json.body) }}",
+          "options": {}
+        }
+      },
+      {
+        "id": "n10",
+        "name": "Juntar ids enviados",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1440,
+          -200
+        ],
+        "parameters": {
+          "jsCode": "// ids de WhatsApp de los mensajes que se enviaron OK (para poder citarlos o editarlos después)\nconst prep = $('Preparar envíos').all();\nconst first = prep[0]?.json ?? {};\nconst ids = $input.all().map((i) => i.json?.key?.id).filter(Boolean);\nif (!ids.length || !first.msgId) return [];\nreturn [{ json: { jid: first.body?.number, instance: first.instance, msgId: first.msgId, replyTo: first.replyTo, ids } }];\n"
+        }
+      },
+      {
+        "id": "n11",
+        "name": "Registrar envíos en el hub",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1680,
+          -200
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "={{ $env.HUB_URL }}/api/agent/sent",
+          "sendHeaders": true,
+          "specifyHeaders": "keypair",
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Authorization",
+                "value": "=Bearer {{ $env.AGENT_TOKEN }}"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify($json) }}",
+          "options": {
+            "timeout": 10000
+          }
+        }
+      }
+    ],
+    "connections": {
+      "Webhook Evolution": {
+        "main": [
+          [
+            {
+              "node": "Clasificar mensaje",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Clasificar mensaje": {
+        "main": [
+          [
+            {
+              "node": "Consultar agente",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Consultar agente": {
+        "main": [
+          [
+            {
+              "node": "¿Hay respuesta?",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "¿Hay respuesta?": {
+        "main": [
+          [
+            {
+              "node": "Esperar demora",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Esperar demora": {
+        "main": [
+          [
+            {
+              "node": "Preparar envíos",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Preparar envíos": {
+        "main": [
+          [
+            {
+              "node": "Enviar por WhatsApp",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Enviar por WhatsApp": {
+        "main": [
+          [
+            {
+              "node": "Juntar ids enviados",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Explicar fallo de envío",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Explicar fallo de envío": {
+        "main": [
+          [
+            {
+              "node": "Avisar fallo de envío",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Juntar ids enviados": {
+        "main": [
+          [
+            {
+              "node": "Registrar envíos en el hub",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    }
+  }
+]

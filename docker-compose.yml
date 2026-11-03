@@ -1,0 +1,114 @@
+# KiriDev — todo el sistema con un solo comando:  ./install.sh   (o:  docker compose up -d --build)
+# Levanta: el hub (panel + agente), Evolution API (WhatsApp), n8n (puente) y sus bases de datos.
+# Las claves se leen del archivo .env (el instalador lo crea solo con secretos al azar).
+name: kiridev
+
+services:
+  hub:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${HUB_PORT:-4961}:4961"
+    environment:
+      PORT: 4961
+      DATA_DIR: /data
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      AGENT_TOKEN: ${AGENT_TOKEN}
+      EVOLUTION_URL: http://evolution:8080
+      EVOLUTION_API_KEY: ${EVOLUTION_API_KEY}
+      EVOLUTION_INSTANCE: ${EVOLUTION_INSTANCE:-kiridev}
+      N8N_WEBHOOK_URL: http://n8n:5678/webhook/kiri-whatsapp
+      # Dirección con la que Evolution (dentro de Docker) descarga los archivos que el agente envía.
+      HUB_PUBLIC_URL: http://hub:4961
+      # Dirección pública del hub (para enlaces de inicio de sesión de MCP y paneles personales). Opcional.
+      HUB_BASE_URL: ${HUB_BASE_URL:-}
+      # Opcionales: si los dejás vacíos, se configuran desde el panel (Cuentas y motores).
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      AGENT_ROOT: ${AGENT_ROOT:-0}
+    volumes:
+      - hub-data:/data
+    depends_on:
+      - evolution
+      - n8n
+
+  evolution:
+    image: evoapicloud/evolution-api:v2.3.7
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${EVOLUTION_PORT:-8080}:8080"
+    environment:
+      SERVER_URL: http://evolution:8080
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY}
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: postgresql://evolution:${POSTGRES_PASSWORD}@postgres:5432/evolution
+      DATABASE_CONNECTION_CLIENT_NAME: kiridev
+      DATABASE_SAVE_DATA_INSTANCE: "true"
+      DATABASE_SAVE_DATA_NEW_MESSAGE: "true"
+      DATABASE_SAVE_DATA_CONTACTS: "true"
+      DATABASE_SAVE_DATA_CHATS: "true"
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: redis://redis:6379/6
+      CACHE_REDIS_PREFIX_KEY: evolution
+      CACHE_REDIS_SAVE_INSTANCES: "false"
+      CACHE_LOCAL_ENABLED: "false"
+      WEBSOCKET_ENABLED: "false"
+      LANGUAGE: es
+    volumes:
+      - evolution-data:/evolution/instances
+    depends_on:
+      - postgres
+      - redis
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:2.42.5
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${N8N_PORT:-5678}:5678"
+    environment:
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_HOST: localhost
+      N8N_PROTOCOL: http
+      WEBHOOK_URL: http://n8n:5678/
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_PERSONALIZATION_ENABLED: "false"
+      GENERIC_TIMEZONE: ${TIMEZONE:-America/Asuncion}
+      # El flujo lee estas variables (en vez de guardar claves dentro de n8n).
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      HUB_URL: http://hub:4961
+      AGENT_TOKEN: ${AGENT_TOKEN}
+      EVOLUTION_URL: http://evolution:8080
+      EVOLUTION_API_KEY: ${EVOLUTION_API_KEY}
+    volumes:
+      - n8n-data:/home/node/.n8n
+      - ./n8n/kiri-whatsapp.workflow.json:/workflows/kiri-whatsapp.workflow.json:ro
+      - ./n8n/start.sh:/start.sh:ro
+    entrypoint: ["/bin/sh", "/start.sh"]
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: evolution
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: evolution
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis-data:/data
+
+volumes:
+  hub-data:
+  evolution-data:
+  n8n-data:
+  postgres-data:
+  redis-data:
