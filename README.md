@@ -172,4 +172,8 @@ Requiere Node 24+. El panel es React + Vite; el servidor, Node.js + Express + SQ
 
 ## Licencia
 
-[MIT](LICENSE) © Matias Vera. Hecho con [Claude Code](https://claude.com/claude-code), [Evolution API](https://github.com/EvolutionAPI/evolution-api) y [n8n](https://n8n.io).
+[PolyForm Noncommercial 1.0.0](LICENSE) © Matias Vera.
+
+El código es **visible y se puede usar, estudiar y modificar con fines no comerciales** (personales, educativos, investigación, organizaciones sin fines de lucro). **No se puede vender, ofrecer como servicio de pago ni usar para un negocio sin permiso del autor.** Para uso comercial, escribime. Esto es *source-available*, no «open source» en el sentido de la OSI.
+
+Hecho con [Claude Code](https://claude.com/claude-code), [Evolution API](https://github.com/EvolutionAPI/evolution-api) y [n8n](https://n8n.io).
